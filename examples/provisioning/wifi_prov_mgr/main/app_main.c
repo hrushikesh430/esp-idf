@@ -18,6 +18,8 @@
 #include <esp_wifi.h>
 #include <esp_event.h>
 #include <nvs_flash.h>
+#include <netdb.h>
+#include <nvs.h>
 
 #include <wifi_provisioning/manager.h>
 
@@ -106,6 +108,29 @@ static EventGroupHandle_t wifi_event_group;
 #define PROV_TRANSPORT_SOFTAP   "softap"
 #define PROV_TRANSPORT_BLE      "ble"
 #define QRCODE_BASE_URL         "https://espressif.github.io/esp-jumpstart/qrcode.html"
+char *ip_address = NULL;
+char *gateway = NULL;
+char *netmask = NULL;
+esp_netif_t *sta_netif = NULL;
+
+static void example_set_static_ip(esp_netif_t *netif)
+{
+    if (esp_netif_dhcpc_stop(netif) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to stop dhcp client");
+        return;
+    }
+    esp_netif_ip_info_t ip;
+    memset(&ip, 0 , sizeof(esp_netif_ip_info_t));
+    ip.ip.addr = ipaddr_addr(ip_address);
+    ip.netmask.addr = ipaddr_addr(gateway);
+    ip.gw.addr = ipaddr_addr(netmask);
+    esp_err_t ret = 0;
+    if ((ret = esp_netif_set_ip_info(netif, &ip)) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set ip info %d",ret);
+        return;
+    }
+    ESP_LOGD(TAG, "Success to set static ip: %s, netmask: %s, gw: %s", ip_address, gateway, netmask);
+}
 
 /* Event handler for catching system events */
 static void event_handler(void* arg, esp_event_base_t event_base,
@@ -136,7 +161,7 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 #ifdef CONFIG_EXAMPLE_RESET_PROV_MGR_ON_FAILURE
                 retries++;
                 if (retries >= CONFIG_EXAMPLE_PROV_MGR_MAX_RETRY_CNT) {
-                    ESP_LOGI(TAG, "Failed to connect with provisioned AP, reseting provisioned credentials");
+                    ESP_LOGI(TAG, "Failed to connect with provisioned AP, resetting provisioned credentials");
                     wifi_prov_mgr_reset_sm_state_on_failure();
                     retries = 0;
                 }
@@ -237,7 +262,43 @@ esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ss
                                           uint8_t **outbuf, ssize_t *outlen, void *priv_data)
 {
     if (inbuf) {
-        ESP_LOGI(TAG, "Received data: %.*s", inlen, (char *)inbuf);
+        char *input = inbuf;
+        nvs_handle_t out_handle;
+        esp_err_t ret = 0;
+
+        /* Store the ip input string to nvs with namespace ip_creds(can give any),
+           to store the ip input string non-volatile memory. Because even that after 
+           restart the same ip address, gateway and netmask should be set*/
+        ret = nvs_open("ip_creds", NVS_READWRITE, &out_handle); 
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open nvs");
+        }
+        const char *key = "ip_info";
+        ret = nvs_set_str(out_handle, key, input); 
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set str");
+        }
+        ret = nvs_commit(out_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit nvs");
+        }
+        nvs_close(out_handle);
+
+        // Extract the IP address
+        ip_address = strtok(input, ":");
+        if (ip_address == NULL) {
+            ESP_LOGI(TAG, "Failed to get ip address");
+        }
+        // Extract the gateway
+        gateway = strtok(NULL, ":");
+        if (gateway == NULL) {
+            ESP_LOGI(TAG, "Failed to get gateway");
+        }
+        // Extract the netmask
+        netmask = strtok(NULL, ":");
+        if (netmask == NULL) {
+            ESP_LOGI(TAG, "Failed to get netmask");
+        }
     }
     char response[] = "SUCCESS";
     *outbuf = (uint8_t *)strdup(response);
@@ -246,8 +307,9 @@ esp_err_t custom_prov_data_handler(uint32_t session_id, const uint8_t *inbuf, ss
         return ESP_ERR_NO_MEM;
     }
     *outlen = strlen(response) + 1; /* +1 for NULL terminating byte */
-
+    example_set_static_ip(sta_netif);  /* api to set the static ip */
     return ESP_OK;
+
 }
 
 static void wifi_prov_print_qr(const char *name, const char *username, const char *pop, const char *transport)
@@ -310,7 +372,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
 
     /* Initialize Wi-Fi including netif with default config */
-    esp_netif_create_default_wifi_sta();
+    sta_netif = esp_netif_create_default_wifi_sta();
 #ifdef CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP
     esp_netif_create_default_wifi_ap();
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_SOFTAP */
@@ -485,6 +547,48 @@ void app_main(void)
         wifi_prov_print_qr(service_name, username, pop, PROV_TRANSPORT_SOFTAP);
 #endif /* CONFIG_EXAMPLE_PROV_TRANSPORT_BLE */
     } else {
+        /* We will fetch the same ip_address input string which sent 
+           before provisioning.
+        */
+        nvs_handle_t out_handle;
+
+        esp_err_t ret = 0;
+        ret = nvs_open("ip_creds", NVS_READWRITE, &out_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open nvs");
+        }
+
+        const char *key = "ip_info";
+        size_t required_size;
+        ret = nvs_get_str(out_handle, key, NULL, &required_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get str while acquiring size");
+        }
+        char *value  = (char*)malloc(required_size);
+        ret = nvs_get_str(out_handle, key, value, &required_size);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get str");
+        }
+        nvs_close(out_handle);
+        ESP_LOGI(TAG, "Received input string %s", value);
+
+        ip_address = strtok(value, ":");
+        if (ip_address == NULL) {
+            ESP_LOGI(TAG, "Failed to get ip address");
+        }
+        // Extract the gateway
+        gateway = strtok(NULL, ":");
+        if (gateway == NULL) {
+            ESP_LOGI(TAG, "Failed to get gateway");
+        }
+        // Extract the netmask
+        netmask = strtok(NULL, ":");
+        if (netmask == NULL) {
+            ESP_LOGI(TAG, "Failed to get netmask");
+        }
+        nvs_close(out_handle);
+        example_set_static_ip(sta_netif); 
+
         ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
 
         /* We don't need the manager as device is already provisioned,
